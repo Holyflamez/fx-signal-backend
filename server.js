@@ -1,62 +1,134 @@
-// FX Signal backend — receives TradingView webhooks, serves signals to the app,
-// and sends a push notification to your phone when a new signal arrives.
+// FX Signal backend — Route 2: no TradingView.
+// Every hour it pulls 1-hour candles for the USD pairs from Twelve Data (free tier),
+// runs the starter strategy (EMA 20/50 cross filtered by EMA 200, ATR stops),
+// stores any new signals and pushes them to your phone.
 const express = require("express");
 const fs = require("fs");
 const path = require("path");
 
 const app = express();
 app.use(express.json({ limit: "50kb" }));
-app.use(express.text({ type: "text/plain", limit: "50kb" })); // TradingView sometimes sends text/plain
 
 const PORT = process.env.PORT || 3000;
-const SECRET = process.env.WEBHOOK_SECRET || "CHANGE_ME";
-const APP_KEY = process.env.APP_KEY || "CHANGE_ME_TOO"; // the phone app sends this
+const APP_KEY = process.env.APP_KEY || "CHANGE_ME";          // phone app sends this
+const TICK_KEY = process.env.TICK_KEY || APP_KEY;             // cron ping sends this
+const TD_KEY = process.env.TWELVE_DATA_KEY || "";             // free key from twelvedata.com
 const DATA_FILE = path.join(__dirname, "data.json");
 const MAX_SIGNALS = 500;
 
-const ALLOWED_PAIRS = ["EURUSD", "GBPUSD", "AUDUSD", "NZDUSD", "USDJPY", "USDCHF", "USDCAD"];
+const PAIRS = ["EURUSD", "GBPUSD", "AUDUSD", "NZDUSD", "USDJPY", "USDCHF", "USDCAD"];
+const STRATEGY = { fast: 20, slow: 50, trend: 200, atrLen: 14, slMult: 1.5, tpMult: 3.0 };
+const BARS_NEEDED = 260;
 
-// ---------- tiny JSON store (fine for one user; swap for a DB later) ----------
-function load() {
-  try { return JSON.parse(fs.readFileSync(DATA_FILE, "utf8")); } catch { return { signals: [], devices: [] }; }
-}
+// ---------- tiny JSON store ----------
+function load() { try { return JSON.parse(fs.readFileSync(DATA_FILE, "utf8")); } catch { return { signals: [], devices: [], lastBar: {} }; } }
 function save(db) { fs.writeFileSync(DATA_FILE, JSON.stringify(db, null, 2)); }
 let db = load();
+db.lastBar = db.lastBar || {};
 
-// ---------- auth for the app ----------
+// ---------- indicators ----------
+function ema(values, len) {
+  const k = 2 / (len + 1);
+  const out = [];
+  let e = values.slice(0, len).reduce((a, b) => a + b, 0) / len;
+  for (let i = 0; i < values.length; i++) {
+    if (i < len - 1) { out.push(null); continue; }
+    if (i === len - 1) { out.push(e); continue; }
+    e = values[i] * k + e * (1 - k);
+    out.push(e);
+  }
+  return out;
+}
+function atr(bars, len) {
+  const tr = bars.map((b, i) => i === 0 ? b.high - b.low : Math.max(b.high - b.low, Math.abs(b.high - bars[i - 1].close), Math.abs(b.low - bars[i - 1].close)));
+  const out = [];
+  let a = tr.slice(0, len).reduce((x, y) => x + y, 0) / len;
+  for (let i = 0; i < tr.length; i++) {
+    if (i < len - 1) { out.push(null); continue; }
+    if (i === len - 1) { out.push(a); continue; }
+    a = (a * (len - 1) + tr[i]) / len; // Wilder smoothing, same as Pine's ta.atr
+    out.push(a);
+  }
+  return out;
+}
+
+// ---------- market data ----------
+async function fetchBars(pair) {
+  const sym = `${pair.slice(0, 3)}/${pair.slice(3)}`;
+  const url = `https://api.twelvedata.com/time_series?symbol=${sym}&interval=1h&outputsize=${BARS_NEEDED}&apikey=${TD_KEY}`;
+  const r = await fetch(url);
+  const j = await r.json();
+  if (j.status === "error" || !j.values) throw new Error(j.message || "no data");
+  // newest first → oldest first; drop a bar that is still forming
+  const cutoff = Date.now() - 60 * 60 * 1000;
+  return j.values
+    .map((v) => ({ t: v.datetime, open: +v.open, high: +v.high, low: +v.low, close: +v.close }))
+    .filter((b) => new Date(b.t.replace(" ", "T") + "Z").getTime() <= cutoff)
+    .reverse();
+}
+
+// ---------- strategy ----------
+function evaluate(pair, bars) {
+  if (bars.length < STRATEGY.trend + 5) return null;
+  const closes = bars.map((b) => b.close);
+  const f = ema(closes, STRATEGY.fast), s = ema(closes, STRATEGY.slow), t = ema(closes, STRATEGY.trend), a = atr(bars, STRATEGY.atrLen);
+  const i = bars.length - 1, p = i - 1;
+  const crossUp = f[p] <= s[p] && f[i] > s[i];
+  const crossDown = f[p] >= s[p] && f[i] < s[i];
+  const close = closes[i];
+  const d = pair.endsWith("JPY") ? 3 : 5;
+  const rnd = (x) => +x.toFixed(d);
+  if (crossUp && close > t[i]) return { dir: "BUY", entry: rnd(close), sl: rnd(close - a[i] * STRATEGY.slMult), tp: rnd(close + a[i] * STRATEGY.tpMult), bar: bars[i].t };
+  if (crossDown && close < t[i]) return { dir: "SELL", entry: rnd(close), sl: rnd(close + a[i] * STRATEGY.slMult), tp: rnd(close - a[i] * STRATEGY.tpMult), bar: bars[i].t };
+  return null;
+}
+
+let running = false;
+async function runEngine() {
+  if (running) return { skipped: "already running" };
+  if (!TD_KEY) return { error: "TWELVE_DATA_KEY not set" };
+  running = true;
+  const report = {};
+  try {
+    for (const pair of PAIRS) {
+      try {
+        const bars = await fetchBars(pair);
+        const last = bars[bars.length - 1]?.t;
+        if (!last || db.lastBar[pair] === last) { report[pair] = "no new bar"; continue; }
+        db.lastBar[pair] = last;
+        const hasOpen = db.signals.some((x) => x.pair === pair && x.status === "open");
+        const sig = evaluate(pair, bars);
+        if (sig && !hasOpen) {
+          const rec = { id: `${Date.now()}-${pair}`, pair, ...sig, tf: "60", receivedAt: new Date().toISOString(), status: "open" };
+          db.signals.unshift(rec);
+          db.signals = db.signals.slice(0, MAX_SIGNALS);
+          report[pair] = `${sig.dir} signal`;
+          notify(`${pair} ${sig.dir}`, `Entry ${sig.entry}  SL ${sig.sl}  TP ${sig.tp}`).catch(() => {});
+        } else report[pair] = sig ? "signal but position already open" : "no setup";
+        save(db);
+      } catch (e) { report[pair] = `error: ${e.message}`; }
+      await new Promise((r) => setTimeout(r, 8500)); // free tier: 8 requests/minute
+    }
+  } finally { running = false; }
+  db.lastRun = { at: new Date().toISOString(), report };
+  save(db);
+  return report;
+}
+
+// run on the hour as a backup (only works while the service is awake)
+setInterval(() => { if (new Date().getUTCMinutes() === 2) runEngine(); }, 60 * 1000);
+
+// ---------- API ----------
 function requireAppKey(req, res, next) {
   if (req.get("x-app-key") !== APP_KEY) return res.status(401).json({ error: "bad app key" });
   next();
 }
 
-// ---------- TradingView webhook ----------
-app.post("/webhook", async (req, res) => {
-  let body = req.body;
-  if (typeof body === "string") { try { body = JSON.parse(body); } catch { return res.status(400).json({ error: "not JSON" }); } }
-  if (!body || body.secret !== SECRET) return res.status(401).json({ error: "bad secret" });
-
-  const pair = String(body.pair || "").toUpperCase().replace(/[^A-Z]/g, "").slice(0, 6);
-  const dir = body.dir === "SELL" ? "SELL" : "BUY";
-  const entry = +body.entry, sl = +body.sl, tp = +body.tp;
-  if (!ALLOWED_PAIRS.includes(pair)) return res.status(400).json({ error: "pair not allowed" });
-  if (![entry, sl, tp].every(Number.isFinite)) return res.status(400).json({ error: "bad prices" });
-
-  const sig = {
-    id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-    pair, dir, entry, sl, tp,
-    tf: body.tf || "60",
-    receivedAt: new Date().toISOString(),
-    status: "open",
-  };
-  db.signals.unshift(sig);
-  db.signals = db.signals.slice(0, MAX_SIGNALS);
-  save(db);
-  res.json({ ok: true, id: sig.id });
-
-  notify(`${pair} ${dir}`, `Entry ${entry}  SL ${sl}  TP ${tp}`).catch(() => {});
+app.get("/tick", async (req, res) => {
+  if (req.query.key !== TICK_KEY) return res.status(401).json({ error: "bad key" });
+  res.json({ ok: true, report: await runEngine() });
 });
 
-// ---------- API used by the phone app ----------
 app.get("/signals", requireAppKey, (req, res) => {
   const since = req.query.since ? new Date(req.query.since) : new Date(Date.now() - 7 * 86400e3);
   res.json(db.signals.filter((s) => new Date(s.receivedAt) >= since));
@@ -65,8 +137,7 @@ app.get("/signals", requireAppKey, (req, res) => {
 app.post("/signals/:id/status", requireAppKey, (req, res) => {
   const s = db.signals.find((x) => x.id === req.params.id);
   if (!s) return res.status(404).json({ error: "not found" });
-  const allowed = ["open", "won", "lost", "skipped"];
-  if (!allowed.includes(req.body.status)) return res.status(400).json({ error: "bad status" });
+  if (!["open", "won", "lost", "skipped"].includes(req.body.status)) return res.status(400).json({ error: "bad status" });
   s.status = req.body.status;
   save(db);
   res.json(s);
@@ -79,16 +150,14 @@ app.post("/devices", requireAppKey, (req, res) => {
   res.json({ ok: true });
 });
 
-app.get("/health", (_req, res) => res.json({ ok: true, signals: db.signals.length, devices: db.devices.length }));
+app.get("/health", (_req, res) => res.json({ ok: true, signals: db.signals.length, devices: db.devices.length, dataKey: !!TD_KEY, lastRun: db.lastRun || null }));
 
-// ---------- Expo push notifications ----------
+// ---------- Expo push ----------
 async function notify(title, body) {
   if (!db.devices.length) return;
-  const messages = db.devices.map((to) => ({ to, title, body, sound: "default" }));
   await fetch("https://exp.host/--/api/v2/push/send", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(messages),
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(db.devices.map((to) => ({ to, title, body, sound: "default" }))),
   });
 }
 
