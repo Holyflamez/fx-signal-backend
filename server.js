@@ -56,9 +56,15 @@ function atr(bars, len) {
 async function fetchBars(pair) {
   const sym = `${pair.slice(0, 3)}/${pair.slice(3)}`;
   const url = `https://api.twelvedata.com/time_series?symbol=${sym}&interval=1h&outputsize=${BARS_NEEDED}&apikey=${TD_KEY}`;
-  const r = await fetch(url);
-  const j = await r.json();
-  if (j.status === "error" || !j.values) throw new Error(j.message || "no data");
+  let j;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const r = await fetch(url);
+    j = await r.json();
+    if (j.values) break;
+    const msg = j.message || "no data";
+    if (attempt === 0 && /API credits/i.test(msg)) { await new Promise((res) => setTimeout(res, 61000)); continue; }
+    throw new Error(msg);
+  }
   // newest first → oldest first; drop a bar that is still forming
   const cutoff = Date.now() - 60 * 60 * 1000;
   return j.values
@@ -85,7 +91,7 @@ function evaluate(pair, bars) {
 
 let running = false;
 async function runEngine() {
-  if (running) return { skipped: "already running" };
+  if (running) return { skipped: "already running — a check is in progress, try again in a minute" };
   if (!TD_KEY) return { error: "TWELVE_DATA_KEY not set" };
   running = true;
   const report = {};
@@ -94,7 +100,8 @@ async function runEngine() {
       try {
         const bars = await fetchBars(pair);
         const last = bars[bars.length - 1]?.t;
-        if (!last || db.lastBar[pair] === last) { report[pair] = "no new bar"; continue; }
+        if (!last) { report[pair] = "no bars returned"; continue; }
+        if (db.lastBar[pair] === last) { report[pair] = `already checked bar ${last}`; continue; }
         db.lastBar[pair] = last;
         const hasOpen = db.signals.some((x) => x.pair === pair && x.status === "open");
         const sig = evaluate(pair, bars);
@@ -107,7 +114,7 @@ async function runEngine() {
         } else report[pair] = sig ? "signal but position already open" : "no setup";
         save(db);
       } catch (e) { report[pair] = `error: ${e.message}`; }
-      await new Promise((r) => setTimeout(r, 8500)); // free tier: 8 requests/minute
+      await new Promise((r) => setTimeout(r, 10000)); // free tier: 8 requests/minute
     }
   } finally { running = false; }
   db.lastRun = { at: new Date().toISOString(), report };
